@@ -43,14 +43,27 @@ export class Button<P extends ButtonProps = ButtonProps> extends HElement<P> {
 
     protected _getProps(props: RenderableProps<P>) {
         const component = this._getComponent(props);
-        const {url, target, disabled, btnType = 'button', hint} = props;
+        // Destructure all necessary props, including 'loading', 'disabled', and 'onClick'
+        const {url, target, disabled, loading, btnType = 'button', hint, onClick} = props;
         const asLink = component === 'a';
+        const isActuallyDisabled = disabled || loading; // Determine effective disabled state
+
+        // Get props from HElement, but we will manage onClick ourselves based on disabled state.
+        const hElementProps = {...super._getProps(props)};
+        delete hElementProps.onClick; // Remove onClick from HElement's props initially
+
         const componentProps: Record<string, unknown> = {
-            ...super._getProps(props),
+            ...hElementProps,
             type: asLink ? undefined : 'button',
-            disabled: (!asLink && disabled) ? '' : undefined,
+            disabled: (!asLink && isActuallyDisabled) ? true : undefined,
             title: hint,
         };
+
+        // Only attach onClick handler if the button is NOT effectively disabled
+        if (!isActuallyDisabled && onClick) {
+            componentProps.onClick = onClick;
+        }
+
         if (btnType) {
             if (['button', 'reset', 'submit'].includes(btnType)) {
                 if (component === 'button') {
