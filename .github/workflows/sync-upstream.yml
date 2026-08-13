@@ -1,0 +1,178 @@
+# Sync specified branches from the upstream fork parent:
+#   https://github.com/easysoft/zui
+#
+# Scheduled runs use DEFAULT_BRANCHES below. Manual runs can override the
+# branch list and choose merge (keep fork-only commits) or reset (exact mirror).
+#
+# Do not use reset on main: this workflow lives on the default branch, and a
+# hard reset would drop it the next time upstream/main is synced.
+name: Sync Upstream
+
+on:
+  schedule:
+    # Daily at 02:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      branches:
+        description: 'Comma-separated branches to sync from easysoft/zui'
+        required: false
+        default: 'main,dev'
+      strategy:
+        description: 'merge keeps local commits; reset makes the branch an exact upstream mirror'
+        type: choice
+        options:
+          - merge
+          - reset
+        default: merge
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: easysoft/zui
+  DEFAULT_BRANCHES: main,dev
+
+jobs:
+  sync:
+    name: Sync branches from easysoft/zui
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync specified branches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCHES: ${{ github.event.inputs.branches }}
+          STRATEGY: ${{ github.event.inputs.strategy || 'merge' }}
+        run: |
+          set -euo pipefail
+
+          BRANCHES="${BRANCHES:-$DEFAULT_BRANCHES}"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --prune upstream
+
+          IFS=',' read -ra BRANCH_LIST <<< "${BRANCHES}"
+          failed=0
+          synced=0
+          skipped=0
+          created=0
+
+          summary() {
+            {
+              echo '## Upstream sync'
+              echo
+              echo "- Upstream: \`${UPSTREAM_REPO}\`"
+              echo "- Strategy: \`${STRATEGY}\`"
+              echo "- Branches: \`${BRANCHES}\`"
+              echo
+              echo '| Branch | Result |'
+              echo '| --- | --- |'
+              cat "${RUNNER_TEMP}/sync-results.md"
+            } >> "${GITHUB_STEP_SUMMARY}"
+          }
+
+          : > "${RUNNER_TEMP}/sync-results.md"
+
+          record() {
+            echo "| \`$1\` | $2 |" >> "${RUNNER_TEMP}/sync-results.md"
+          }
+
+          for raw in "${BRANCH_LIST[@]}"; do
+            branch="$(echo "${raw}" | xargs)"
+            [ -z "${branch}" ] && continue
+
+            echo "::group::Sync ${branch}"
+
+            if ! git show-ref --verify --quiet "refs/remotes/upstream/${branch}"; then
+              echo "::error::Upstream branch '${branch}' does not exist on ${UPSTREAM_REPO}"
+              record "${branch}" "missing on upstream"
+              failed=$((failed + 1))
+              echo "::endgroup::"
+              continue
+            fi
+
+            upstream_sha="$(git rev-parse "upstream/${branch}")"
+
+            if ! git ls-remote --exit-code origin "refs/heads/${branch}" >/dev/null; then
+              echo "Creating origin/${branch} from upstream/${branch} (${upstream_sha})"
+              git push origin "refs/remotes/upstream/${branch}:refs/heads/${branch}"
+              record "${branch}" "created from upstream"
+              created=$((created + 1))
+              echo "::endgroup::"
+              continue
+            fi
+
+            git fetch origin "${branch}"
+            origin_sha="$(git rev-parse "origin/${branch}")"
+
+            if [ "${origin_sha}" = "${upstream_sha}" ]; then
+              echo "origin/${branch} already matches upstream/${branch}"
+              record "${branch}" "already up to date"
+              skipped=$((skipped + 1))
+              echo "::endgroup::"
+              continue
+            fi
+
+            git checkout -B "${branch}" "origin/${branch}"
+
+            if [ "${STRATEGY}" = "reset" ]; then
+              echo "Resetting ${branch} to upstream/${branch}"
+              git reset --hard "upstream/${branch}"
+              git push --force-with-lease origin "${branch}"
+              record "${branch}" "reset to \`${upstream_sha:0:7}\`"
+              synced=$((synced + 1))
+              echo "::endgroup::"
+              continue
+            fi
+
+            if git merge-base --is-ancestor "${upstream_sha}" "${origin_sha}"; then
+              echo "origin/${branch} already contains upstream/${branch}"
+              record "${branch}" "already contains upstream"
+              skipped=$((skipped + 1))
+              echo "::endgroup::"
+              continue
+            fi
+
+            if git merge-base --is-ancestor "${origin_sha}" "${upstream_sha}"; then
+              echo "Fast-forwarding ${branch} to upstream/${branch}"
+              git merge --ff-only "upstream/${branch}"
+              git push origin "${branch}"
+              record "${branch}" "fast-forwarded to \`${upstream_sha:0:7}\`"
+              synced=$((synced + 1))
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "Merging upstream/${branch} into ${branch}"
+            if git merge --no-edit "upstream/${branch}"; then
+              git push origin "${branch}"
+              record "${branch}" "merged \`${upstream_sha:0:7}\`"
+              synced=$((synced + 1))
+            else
+              git merge --abort || true
+              echo "::error::Could not merge upstream/${branch} into ${branch}; resolve conflicts locally"
+              record "${branch}" "merge conflict"
+              failed=$((failed + 1))
+            fi
+
+            echo "::endgroup::"
+          done
+
+          summary
+
+          echo "synced=${synced} created=${created} skipped=${skipped} failed=${failed}"
+          if [ "${failed}" -ne 0 ]; then
+            exit 1
+          fi
